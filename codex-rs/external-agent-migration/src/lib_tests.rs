@@ -346,6 +346,47 @@ fn subagent_accepts_yaml_block_lists_by_ignoring_unsupported_fields() {
 }
 
 #[test]
+fn subagent_rejects_deeply_nested_flow_yaml_frontmatter_without_parsing() {
+    // Issue openai/codex#53374: depth drives serde_yaml cost; bound before parse.
+    let depth = 200;
+    let deep = format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
+    let content = format!(
+        "---\nname: probe\ndescription: probe agent\npayload: {deep}\n---\n\nAgent body.\n"
+    );
+    let document = parse_document_content(&content);
+    assert!(
+        document.frontmatter_error.is_some(),
+        "expected nesting-depth rejection"
+    );
+    assert!(agent_metadata(&document).is_none());
+}
+
+#[test]
+fn subagent_accepts_shallow_agent_frontmatter() {
+    let content =
+        "---\nname: probe\ndescription: probe agent\npayload: [1, [2, 3]]\n---\n\nAgent body.\n";
+    let document = parse_document_content(content);
+    assert!(document.frontmatter_error.is_none());
+    assert!(agent_metadata(&document).is_some());
+}
+
+#[test]
+fn subagent_rejects_oversized_agent_document() {
+    let mut content = String::from("---\nname: probe\ndescription: probe agent\n---\n\n");
+    content.push_str(&"x".repeat(1024 * 1024));
+    let document = parse_document_content(&content);
+    assert!(
+        document
+            .frontmatter_error
+            .as_deref()
+            .is_some_and(|err| err.contains("byte limit")),
+        "expected size rejection, got {:?}",
+        document.frontmatter_error
+    );
+    assert!(agent_metadata(&document).is_none());
+}
+
+#[test]
 fn subagent_requires_minimum_codex_agent_fields() {
     let missing_description =
         parse_document_content("---\nname: incomplete\n---\nInvestigate carefully.\n");

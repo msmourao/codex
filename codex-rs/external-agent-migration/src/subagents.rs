@@ -9,6 +9,11 @@ use std::path::Path;
 use std::path::PathBuf;
 use toml::Value as TomlValue;
 
+/// Align with `exec-server` skill discovery (`MAX_FILE_BYTES`).
+const MAX_AGENT_FILE_BYTES: usize = 1024 * 1024;
+/// Agent frontmatter only needs shallow scalars/lists; deep flow YAML is a DoS vector via `serde_yaml`.
+const MAX_FRONTMATTER_YAML_NESTING: usize = 64;
+
 #[derive(Debug)]
 pub(crate) struct ParsedDocument {
     pub(crate) frontmatter: BTreeMap<String, FrontmatterValue>,
@@ -114,11 +119,36 @@ pub(crate) fn subagent_target_file(source_file: &Path, target_agents: &Path) -> 
 }
 
 fn parse_document(source_file: &Path) -> io::Result<ParsedDocument> {
+    let metadata = fs::metadata(source_file)?;
+    let Ok(size) = usize::try_from(metadata.len()) else {
+        return Ok(rejected_document(format!(
+            "agent file {} is too large",
+            source_file.display()
+        )));
+    };
+    if size > MAX_AGENT_FILE_BYTES {
+        return Ok(rejected_document(format!(
+            "agent file exceeds the {MAX_AGENT_FILE_BYTES}-byte limit"
+        )));
+    }
     let content = fs::read_to_string(source_file)?;
     Ok(parse_document_content(&content))
 }
 
+fn rejected_document(frontmatter_error: String) -> ParsedDocument {
+    ParsedDocument {
+        frontmatter: BTreeMap::new(),
+        body: String::new(),
+        frontmatter_error: Some(frontmatter_error),
+    }
+}
+
 pub(crate) fn parse_document_content(content: &str) -> ParsedDocument {
+    if content.len() > MAX_AGENT_FILE_BYTES {
+        return rejected_document(format!(
+            "agent file exceeds the {MAX_AGENT_FILE_BYTES}-byte limit"
+        ));
+    }
     let Some(rest) = content
         .strip_prefix("---\n")
         .or_else(|| content.strip_prefix("---\r\n"))
@@ -161,9 +191,70 @@ fn frontmatter_end(rest: &str) -> Option<(usize, usize)> {
     .min_by_key(|(end, _body_start)| *end)
 }
 
+/// Cheap pre-parse bound on flow/block collection nesting (`[` / `{` / `]` / `}`).
+/// Skips quoted scalars so description text does not inflate depth.
+fn yaml_flow_nesting_depth(raw: &str) -> usize {
+    let mut depth = 0usize;
+    let mut max_depth = 0usize;
+    let mut chars = raw.chars().peekable();
+    let mut in_single = false;
+    let mut in_double = false;
+
+    while let Some(ch) = chars.next() {
+        if in_single {
+            if ch == '\'' {
+                if chars.peek() == Some(&'\'') {
+                    chars.next();
+                } else {
+                    in_single = false;
+                }
+            }
+            continue;
+        }
+        if in_double {
+            if ch == '\\' {
+                let _ = chars.next();
+            } else if ch == '"' {
+                in_double = false;
+            }
+            continue;
+        }
+        match ch {
+            '\'' => in_single = true,
+            '"' => in_double = true,
+            '[' | '{' => {
+                depth = depth.saturating_add(1);
+                max_depth = max_depth.max(depth);
+            }
+            ']' | '}' => {
+                depth = depth.saturating_sub(1);
+            }
+            '#' => {
+                // Line comment: skip to newline.
+                for next in chars.by_ref() {
+                    if next == '\n' {
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    max_depth
+}
+
 fn parse_frontmatter(
     raw_frontmatter: &str,
 ) -> (BTreeMap<String, FrontmatterValue>, Option<String>) {
+    let nesting = yaml_flow_nesting_depth(raw_frontmatter);
+    if nesting > MAX_FRONTMATTER_YAML_NESTING {
+        return (
+            BTreeMap::new(),
+            Some(format!(
+                "frontmatter YAML nesting depth {nesting} exceeds limit {MAX_FRONTMATTER_YAML_NESTING}"
+            )),
+        );
+    }
     let parsed: YamlValue = match serde_yaml::from_str(raw_frontmatter) {
         Ok(parsed) => parsed,
         Err(err) => return (BTreeMap::new(), Some(err.to_string())),
